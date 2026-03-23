@@ -7,7 +7,6 @@ from statistics import mean, stdev
 from scipy.stats import norm, chi2, binom, shapiro, ttest_1samp
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import numpy as np
 
@@ -24,7 +23,6 @@ class ShotsData:
         # Derived metrics
         self.avg_coords = None  # (mean_x, mean_y)
         self.distances = []     # radial distances from the mean
-        self.accuracy = None
         self.stdX_dev = None
         self.stdY_dev = None
         self.X_mean = None
@@ -64,21 +62,45 @@ class ShotsData:
         return [(i, s[0], s[1]) for i, s in enumerate(self.shots)]
 
     def import_from_excel(self, path):
-        """Load shots from an Excel file with columns 'X (cm)' and 'Y (cm)'."""
+        """Load shots from an Excel file.
+
+        Supported formats:
+        - 2D: columns 'X (cm)' and 'Y (cm)'
+        - 1D: column 'distance_m' (values in meters, converted to cm)
+        """
         df_shots = pd.read_excel(path)
-        if 'X (cm)' not in df_shots.columns or 'Y (cm)' not in df_shots.columns:
-            raise ValueError("Excel must have columns 'X (cm)' and 'Y (cm)'")
         self.shots.clear()
-        for _, row in df_shots.iterrows():
-            x = float(row['X (cm)'])
-            y = float(row['Y (cm)'])
-            self.shots.append((x, y))
+        if 'X (cm)' in df_shots.columns and 'Y (cm)' in df_shots.columns:
+            for _, row in df_shots.iterrows():
+                x = float(row['X (cm)'])
+                y = float(row['Y (cm)'])
+                self.shots.append((x, y))
+        elif 'distance_m' in df_shots.columns:
+            # Drop summary/header rows: keep only rows with integer index
+            idx = pd.to_numeric(df_shots['index'], errors='coerce')
+            df_shots = df_shots[idx.notna() & (idx % 1 == 0)]
+            df_shots['distance_m'] = pd.to_numeric(df_shots['distance_m'], errors='coerce')
+            df_shots = df_shots.dropna(subset=['distance_m'])
+            for _, row in df_shots.iterrows():
+                d = float(row['distance_m']) * 100  # meters to cm
+                self.shots.append((d, 0.0))
+        else:
+            raise ValueError(
+                "Excel must have columns 'X (cm)' and 'Y (cm)', "
+                "or 'distance_m'"
+            )
 
     def export_to_excel(self, path):
-        """Save current shots to an Excel file with columns 'X (cm)', 'Y (cm)'."""
+        """Save current shots to an Excel file."""
         if not self.shots:
             raise ValueError("No shots data to export.")
-        df_shots = pd.DataFrame(self.shots, columns=['X (cm)', 'Y (cm)'])
+        all_y_zero = all(s[1] == 0.0 for s in self.shots)
+        if all_y_zero:
+            df_shots = pd.DataFrame(
+                [s[0] / 100 for s in self.shots], columns=['distance_m']
+            )
+        else:
+            df_shots = pd.DataFrame(self.shots, columns=['X (cm)', 'Y (cm)'])
         with pd.ExcelWriter(path) as writer:
             df_shots.to_excel(writer, sheet_name='Shots', index=False)
 
@@ -103,7 +125,6 @@ class ShotsData:
             # Clear out any old metrics
             self.avg_coords = None
             self.distances = []
-            self.accuracy = None
             self.stdX_dev = None
             self.stdY_dev = None
             self.X_mean = None
@@ -126,9 +147,6 @@ class ShotsData:
         
         distances = [sqrt((sx - avg_x)**2 + (sy - avg_y)**2) for sx, sy in self.shots]
         self.distances = distances
-        
-        within_radius = sum(1 for d in distances if d <= self.valid_radius)
-        self.accuracy = within_radius
         self.total_shots = len(self.shots)
         
         # Standard deviation (stdev) only valid if 2+ points
@@ -215,6 +233,48 @@ class ShotsData:
             result[f'{key}_se'] = np.std(vals)
 
         return result
+
+    def rolling_disparity(self, window_size):
+        """Compute disparity for each rolling window of *window_size* shots.
+
+        Disparity is the maximum pairwise Euclidean distance between any two
+        shots in the window (the "diameter" of the group).  For 1-D data
+        (all y == 0) this reduces to max(x) - min(x).
+
+        Returns a list of dicts sorted by disparity descending::
+
+            [{'start': int,          # 0-based index of first shot in window
+              'end': int,            # 0-based index of last shot in window
+              'disparity': float,    # max pairwise distance (cm)
+              'shots': [(x,y), ...]  # the shots in this window
+             }, ...]
+        """
+        n = len(self.shots)
+        if window_size < 2 or n < window_size:
+            return []
+
+        results = []
+        shots_arr = np.array(self.shots)
+        global_mean = shots_arr.mean(axis=0)
+        for i in range(n - window_size + 1):
+            window = shots_arr[i:i + window_size]
+            # Max pairwise distance = max over all pairs ||p_i - p_j||
+            diffs = window[:, np.newaxis, :] - window[np.newaxis, :, :]
+            dists = np.sqrt((diffs ** 2).sum(axis=2))
+            disparity = float(dists.max())
+            # Distance from window center to full-data mean
+            window_mean = window.mean(axis=0)
+            dist_to_mean = float(np.sqrt(((window_mean - global_mean) ** 2).sum()))
+            results.append({
+                'start': i,
+                'end': i + window_size - 1,
+                'disparity': disparity,
+                'dist_to_mean': dist_to_mean,
+                'shots': [tuple(s) for s in window],
+            })
+
+        results.sort(key=lambda r: r['disparity'], reverse=True)
+        return results
 
     def reset_probability_results(self):
         self.prob_hit_one_shot = None
@@ -413,7 +473,6 @@ class ShotAccuracyApp:
         # Tkinter Variables
         self.trials_var = tk.StringVar()
         self.hits_var = tk.StringVar()
-        self.radius_var = tk.StringVar(value=str(self.data.valid_radius))
 
         # Frames inside main tab
         self.input_frame = tk.Frame(self.main_tab)
@@ -436,6 +495,13 @@ class ShotAccuracyApp:
         self.setup_visualization_plot()
 
         # -----------------
+        # ROLLING DISPARITY TAB
+        # -----------------
+        self.disparity_tab = tk.Frame(self.notebook)
+        self.notebook.add(self.disparity_tab, text="Rolling Disparity")
+        self.build_disparity_ui(self.disparity_tab)
+
+        # -----------------
         # COMPARISON TAB
         # -----------------
         self.compare_tab = tk.Frame(self.notebook)
@@ -450,13 +516,18 @@ class ShotAccuracyApp:
     # MAIN TAB
     # ----------------------------------------------------------------
     def create_shot_entries(self):
-        columns = ('#1', '#2')
+        columns = ('order', 'x', 'y')
         self.tree = ttk.Treeview(self.input_frame, columns=columns, show='headings', height=10)
-        self.tree.heading('#1', text='X (cm)')
-        self.tree.heading('#2', text='Y (cm)')
-        self.tree.column('#1', width=100, anchor='center')
-        self.tree.column('#2', width=100, anchor='center')
+        self.tree.heading('order', text='#', command=lambda: self.sort_tree('order'))
+        self.tree.heading('x', text='X (cm)', command=lambda: self.sort_tree('x'))
+        self.tree.heading('y', text='Y (cm)', command=lambda: self.sort_tree('y'))
+        self.tree.column('order', width=50, anchor='center')
+        self.tree.column('x', width=100, anchor='center')
+        self.tree.column('y', width=100, anchor='center')
         self.tree.pack(side='left', fill=tk.BOTH, expand=True)
+
+        self.sort_column = 'order'
+        self.sort_reverse = False
 
         scrollbar = ttk.Scrollbar(self.input_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscroll=scrollbar.set)
@@ -464,6 +535,24 @@ class ShotAccuracyApp:
 
         self.tree.bind('<ButtonRelease-1>', self.on_shot_change)
         self.tree.bind('<KeyRelease>', self.on_shot_change)
+
+    def sort_tree(self, col):
+        if self.sort_column == col:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_column = col
+            self.sort_reverse = False
+        items = [(self.tree.set(k, col), k) for k in self.tree.get_children()]
+        items.sort(key=lambda t: float(t[0]), reverse=self.sort_reverse)
+        for index, (_, k) in enumerate(items):
+            self.tree.move(k, '', index)
+        # Update heading to show sort direction
+        for c in ('order', 'x', 'y'):
+            base = {'order': '#', 'x': 'X (cm)', 'y': 'Y (cm)'}[c]
+            arrow = ''
+            if c == col:
+                arrow = ' \u25bc' if self.sort_reverse else ' \u25b2'
+            self.tree.heading(c, text=base + arrow)
 
     def create_main_controls(self):
         # Add & Remove
@@ -480,25 +569,18 @@ class ShotAccuracyApp:
         self.export_button = tk.Button(self.controls_frame, text="Export to Excel", command=self.export_to_excel)
         self.export_button.grid(row=0, column=3, padx=5)
 
-        # Radius
-        self.radius_label = tk.Label(self.controls_frame, text="Target Radius (cm):")
-        self.radius_label.grid(row=1, column=0, padx=5, pady=5, sticky='e')
-
-        self.radius_entry = tk.Entry(self.controls_frame, textvariable=self.radius_var, width=10)
-        self.radius_entry.grid(row=1, column=1, padx=5, pady=5, sticky='w')
+        self.clear_button = tk.Button(self.controls_frame, text="Clear Data", command=self.clear_data)
+        self.clear_button.grid(row=0, column=4, padx=5)
 
         # Metrics (selectable labels) — column 0: values, column 1: p-values / ± SE
         self.avg_label = self._selectable_label(self.metrics_frame, "Average Coordinates: N/A",
                                                 row=0, column=0, sticky='w', padx=10)
         self.avg_p_label = self._selectable_label(self.metrics_frame, "",
                                                   row=0, column=1, sticky='w', padx=10)
-        self.accuracy_label = self._selectable_label(self.metrics_frame,
-                                                     f"Accuracy (within {self.data.valid_radius}cm): N/A",
-                                                     row=1, column=0, sticky='w', padx=10)
         self.stdX_label = self._selectable_label(self.metrics_frame, "Standard Deviation X: N/A",
-                                                 row=2, column=0, sticky='w', padx=10)
+                                                 row=1, column=0, sticky='w', padx=10)
         self.stdX_p_label = self._selectable_label(self.metrics_frame, "",
-                                                   row=2, column=1, sticky='w', padx=10)
+                                                   row=1, column=1, sticky='w', padx=10)
         self.stdY_label = self._selectable_label(self.metrics_frame, "Standard Deviation Y: N/A",
                                                  row=3, column=0, sticky='w', padx=10)
         self.stdY_p_label = self._selectable_label(self.metrics_frame, "",
@@ -587,7 +669,6 @@ class ShotAccuracyApp:
         # Event bindings
         self.trials_var.trace_add('write', self.on_prob_input_change)
         self.hits_var.trace_add('write', self.on_prob_input_change)
-        self.radius_var.trace_add('write', self.on_radius_change)
 
     def _selectable_label(self, parent, text, **grid_kwargs):
         """Create a read-only Entry widget that looks like a label but allows text selection."""
@@ -608,7 +689,7 @@ class ShotAccuracyApp:
         # Rebuild shots from the tree
         new_shots = []
         for item in self.tree.get_children():
-            x, y = self.tree.item(item)['values']
+            _, x, y = self.tree.item(item)['values']
             new_shots.append((float(x), float(y)))
         self.data.shots = new_shots
         self.update_metrics_and_visualization()
@@ -637,7 +718,8 @@ class ShotAccuracyApp:
                 x_val = float(x_str)
                 y_val = float(y_str)
                 self.data.add_shot(x_val, y_val)
-                self.tree.insert('', 'end', values=(x_val, y_val))
+                order = len(self.data.shots)
+                self.tree.insert('', 'end', values=(order, x_val, y_val))
                 add_window.destroy()
                 self.update_metrics_and_visualization()
             except ValueError:
@@ -656,6 +738,16 @@ class ShotAccuracyApp:
             self.data.remove_shot(index)
         self.update_metrics_and_visualization()
 
+    def clear_data(self):
+        if not self.data.shots:
+            return
+        if not messagebox.askyesno("Clear Data", "Are you sure you want to clear all data?"):
+            return
+        self.data.shots.clear()
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.update_metrics_and_visualization()
+
     def import_from_excel(self):
         file_path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
         if not file_path:
@@ -666,8 +758,8 @@ class ShotAccuracyApp:
             for item in self.tree.get_children():
                 self.tree.delete(item)
             # Repopulate
-            for x, y in self.data.shots:
-                self.tree.insert('', 'end', values=(x, y))
+            for i, (x, y) in enumerate(self.data.shots, 1):
+                self.tree.insert('', 'end', values=(i, x, y))
             self.update_metrics_and_visualization()
             messagebox.showinfo("Import Successful", f"Data imported successfully from {file_path}")
         except Exception as e:
@@ -731,7 +823,6 @@ class ShotAccuracyApp:
         if not self.data.shots:
             # Clear everything
             _s(self.avg_label, "Average Coordinates: N/A")
-            _s(self.accuracy_label, f"Accuracy (within {self.data.valid_radius}cm): N/A")
             _s(self.stdX_label, "Standard Deviation X: N/A")
             _s(self.stdY_label, "Standard Deviation Y: N/A")
             _s(self.rms_x_label, "RMS X: N/A")
@@ -761,10 +852,6 @@ class ShotAccuracyApp:
             _s(self.avg_p_label, f"bias: X {mean_x_p}, Y {mean_y_p}")
         else:
             _s(self.avg_p_label, "")
-
-        within_radius = self.data.accuracy
-        total = self.data.total_shots
-        _s(self.accuracy_label, f"Accuracy (within {self.data.valid_radius}cm): {within_radius} / {total}")
 
         if self.data.stdX_dev is not None:
             _s(self.stdX_label, f"Standard Deviation X: {self.data.stdX_dev:.2f} cm")
@@ -875,14 +962,6 @@ class ShotAccuracyApp:
             _s(self.prob_lower_50_label, "Lower Probability (50% confidence): N/A")
             _s(self.prob_higher_50_label, "Higher Probability (50% confidence): N/A")
 
-    def on_radius_change(self, *args):
-        try:
-            new_radius = float(self.radius_var.get())
-            self.data.set_radius(new_radius)
-            self.update_metrics_and_visualization()
-        except ValueError:
-            self.radius_var.set(str(self.data.valid_radius))
-
     def on_prob_input_change(self, *args):
         try:
             t = int(self.trials_var.get().strip())
@@ -957,10 +1036,6 @@ class ShotAccuracyApp:
             if self.data.avg_coords:
                 avg_x, avg_y = self.data.avg_coords
                 self.ax_vis.scatter(avg_x, avg_y, c='green', marker='x', s=100, label='Center')
-                circle = Circle((avg_x, avg_y), self.data.valid_radius,
-                                color='red', fill=False, linestyle='--',
-                                label=f'{self.data.valid_radius}cm Radius')
-                self.ax_vis.add_patch(circle)
 
             self.ax_vis.legend()
             self.ax_vis.set_aspect('equal', adjustable='datalim')
@@ -1011,6 +1086,142 @@ class ShotAccuracyApp:
 
         self.fig_density.tight_layout()
         self.canvas_density.draw()
+
+    # ----------------------------------------------------------------
+    # ROLLING DISPARITY TAB
+    # ----------------------------------------------------------------
+
+    def build_disparity_ui(self, parent):
+        # Controls row
+        ctrl = tk.Frame(parent)
+        ctrl.pack(pady=10, padx=10, fill=tk.X)
+
+        tk.Label(ctrl, text="Window size (n):").pack(side='left', padx=5)
+        self.disparity_n_var = tk.StringVar(value="10")
+        tk.Entry(ctrl, textvariable=self.disparity_n_var, width=8).pack(side='left', padx=5)
+        tk.Button(ctrl, text="Compute", command=self.on_compute_disparity).pack(side='left', padx=10)
+
+        self.disparity_summary_var = tk.StringVar(value="")
+        summary = tk.Entry(ctrl, textvariable=self.disparity_summary_var, state='readonly',
+                           readonlybackground=self._label_bg, relief='flat',
+                           borderwidth=0, highlightthickness=0, width=60)
+        summary.pack(side='left', padx=10)
+        summary._var = self.disparity_summary_var
+        self.disparity_summary_label = summary
+
+        # Results treeview
+        results_frame = tk.Frame(parent)
+        results_frame.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
+
+        cols = ('rank', 'start', 'end', 'disparity', 'dist_to_mean')
+        self.disp_tree = ttk.Treeview(results_frame, columns=cols, show='headings', height=20)
+        self.disp_tree.heading('rank', text='Rank',
+                               command=lambda: self._sort_disp_tree('rank'))
+        self.disp_tree.heading('start', text='From shot #',
+                               command=lambda: self._sort_disp_tree('start'))
+        self.disp_tree.heading('end', text='To shot #',
+                               command=lambda: self._sort_disp_tree('end'))
+        self.disp_tree.heading('disparity', text='Disparity (cm)',
+                               command=lambda: self._sort_disp_tree('disparity'))
+        self.disp_tree.heading('dist_to_mean', text='Dist to mean (cm)',
+                               command=lambda: self._sort_disp_tree('dist_to_mean'))
+        self.disp_tree.column('rank', width=60, anchor='center')
+        self.disp_tree.column('start', width=100, anchor='center')
+        self.disp_tree.column('end', width=100, anchor='center')
+        self.disp_tree.column('disparity', width=140, anchor='center')
+        self.disp_tree.column('dist_to_mean', width=140, anchor='center')
+        self._disp_sort_col = 'rank'
+        self._disp_sort_rev = False
+        self.disp_tree.pack(side='left', fill=tk.BOTH, expand=True)
+
+        scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.disp_tree.yview)
+        self.disp_tree.configure(yscroll=scrollbar.set)
+        scrollbar.pack(side='right', fill='y')
+
+        # Detail area: shows shots in the selected window
+        detail_frame = tk.LabelFrame(parent, text="Window detail")
+        detail_frame.pack(pady=10, padx=10, fill=tk.X)
+
+        self.disp_detail_var = tk.StringVar(value="Select a row above to see the shots in that window.")
+        detail_label = tk.Label(detail_frame, textvariable=self.disp_detail_var,
+                                justify='left', anchor='w', wraplength=800)
+        detail_label.pack(padx=10, pady=5, fill=tk.X)
+
+        self.disp_tree.bind('<<TreeviewSelect>>', self.on_disparity_select)
+        self._disparity_results = []
+
+    def on_compute_disparity(self):
+        try:
+            n = int(self.disparity_n_var.get())
+        except ValueError:
+            messagebox.showerror("Input Error", "Window size must be an integer.")
+            return
+        if n < 2:
+            messagebox.showerror("Input Error", "Window size must be at least 2.")
+            return
+        if len(self.data.shots) < n:
+            messagebox.showwarning("Not enough data",
+                                   f"Need at least {n} shots, have {len(self.data.shots)}.")
+            return
+
+        results = self.data.rolling_disparity(n)
+        self._disparity_results = results
+
+        # Clear tree
+        for item in self.disp_tree.get_children():
+            self.disp_tree.delete(item)
+
+        # Populate
+        for rank, r in enumerate(results, 1):
+            self.disp_tree.insert('', 'end', values=(
+                rank,
+                r['start'] + 1,   # 1-based for display
+                r['end'] + 1,
+                f"{r['disparity']:.2f}",
+                f"{r['dist_to_mean']:.2f}",
+            ))
+
+        worst = results[0]['disparity'] if results else 0
+        best = results[-1]['disparity'] if results else 0
+        self.disparity_summary_label._var.set(
+            f"Windows: {len(results)}  |  "
+            f"Worst: {worst:.2f} cm  |  Best: {best:.2f} cm"
+        )
+        self.disp_detail_var.set("Select a row above to see the shots in that window.")
+
+    def on_disparity_select(self, event):
+        sel = self.disp_tree.selection()
+        if not sel:
+            return
+        item = sel[0]
+        rank = int(self.disp_tree.set(item, 'rank'))
+        r = self._disparity_results[rank - 1]
+        lines = [f"Window shots #{r['start']+1}\u2013#{r['end']+1}  "
+                 f"(disparity {r['disparity']:.2f} cm):"]
+        for i, (x, y) in enumerate(r['shots']):
+            shot_num = r['start'] + i + 1
+            lines.append(f"  #{shot_num}: X={x:.2f}, Y={y:.2f}")
+        self.disp_detail_var.set("\n".join(lines))
+
+    def _sort_disp_tree(self, col):
+        if self._disp_sort_col == col:
+            self._disp_sort_rev = not self._disp_sort_rev
+        else:
+            self._disp_sort_col = col
+            self._disp_sort_rev = False
+        items = [(self.disp_tree.set(k, col), k) for k in self.disp_tree.get_children()]
+        items.sort(key=lambda t: float(t[0]), reverse=self._disp_sort_rev)
+        for i, (_, k) in enumerate(items):
+            self.disp_tree.move(k, '', i)
+        labels = {
+            'rank': 'Rank', 'start': 'From shot #', 'end': 'To shot #',
+            'disparity': 'Disparity (cm)', 'dist_to_mean': 'Dist to mean (cm)',
+        }
+        for c, base in labels.items():
+            arrow = ''
+            if c == col:
+                arrow = ' \u25bc' if self._disp_sort_rev else ' \u25b2'
+            self.disp_tree.heading(c, text=base + arrow)
 
     # ----------------------------------------------------------------
     # SECOND TAB: Compare Two Datasets
@@ -1221,7 +1432,6 @@ def cli_mode():
         
         avg_coords = data.avg_coords
         print(f"Average coords: {avg_coords}")
-        print(f"Shots within radius {data.valid_radius}cm: {data.accuracy} / {data.total_shots}")
         print(f"Std dev X={data.stdX_dev}, Y={data.stdY_dev}")
         
         if data.prob_hit_one_shot is not None:
