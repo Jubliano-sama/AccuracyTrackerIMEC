@@ -474,20 +474,44 @@ class ShotAccuracyApp:
         self.trials_var = tk.StringVar()
         self.hits_var = tk.StringVar()
 
-        # Frames inside main tab
-        self.input_frame = tk.Frame(self.main_tab)
+        # Scrollable canvas inside main tab
+        _main_canvas = tk.Canvas(self.main_tab)
+        _main_scrollbar = ttk.Scrollbar(self.main_tab, orient=tk.VERTICAL, command=_main_canvas.yview)
+        _main_canvas.configure(yscrollcommand=_main_scrollbar.set)
+        _main_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        _main_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        _main_content = tk.Frame(_main_canvas)
+        _main_canvas_window = _main_canvas.create_window((0, 0), window=_main_content, anchor='nw')
+
+        def _on_main_content_configure(event):
+            _main_canvas.configure(scrollregion=_main_canvas.bbox('all'))
+
+        def _on_main_canvas_configure(event):
+            _main_canvas.itemconfig(_main_canvas_window, width=event.width)
+
+        _main_content.bind('<Configure>', _on_main_content_configure)
+        _main_canvas.bind('<Configure>', _on_main_canvas_configure)
+
+        def _on_mousewheel(event):
+            _main_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+
+        _main_canvas.bind_all('<MouseWheel>', _on_mousewheel)
+
+        # Frames inside main tab (placed in scrollable content frame)
+        self.input_frame = tk.Frame(_main_content)
         self.input_frame.pack(pady=10, padx=10, fill=tk.X)
 
-        self.controls_frame = tk.Frame(self.main_tab)
+        self.controls_frame = tk.Frame(_main_content)
         self.controls_frame.pack(pady=10, padx=10, fill=tk.X)
 
-        self.metrics_frame = tk.Frame(self.main_tab)
+        self.metrics_frame = tk.Frame(_main_content)
         self.metrics_frame.pack(pady=10, padx=10, fill=tk.X)
 
-        self.prob_frame = tk.Frame(self.main_tab)
+        self.prob_frame = tk.Frame(_main_content)
         self.prob_frame.pack(pady=10, padx=10, fill=tk.X)
 
-        self.plots_frame = tk.Frame(self.main_tab)
+        self.plots_frame = tk.Frame(_main_content)
         self.plots_frame.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
 
         self.create_shot_entries()
@@ -996,6 +1020,7 @@ class ShotAccuracyApp:
         self.fig_vis, self.ax_vis = plt.subplots(figsize=(6,6))
         self.canvas_vis = FigureCanvasTkAgg(self.fig_vis, master=self.visualization_frame)
         self.canvas_vis.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas_vis.get_tk_widget().config(height=500)
         self.ax_vis.set_title('Shot Distribution')
         self.ax_vis.set_xlabel('X (cm)')
         self.ax_vis.set_ylabel('Y (cm)')
@@ -1006,6 +1031,7 @@ class ShotAccuracyApp:
         self.fig_density, (self.ax_density_x, self.ax_density_y) = plt.subplots(2, 1, figsize=(6,6))
         self.canvas_density = FigureCanvasTkAgg(self.fig_density, master=self.density_frame)
         self.canvas_density.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas_density.get_tk_widget().config(height=500)
         self.ax_density_x.set_title('X Coordinate Density')
         self.ax_density_x.set_xlabel('X (cm)')
         self.ax_density_x.set_ylabel('Density')
@@ -1541,7 +1567,7 @@ def main():
         cli_mode()
     else:
         root = tk.Tk()
-        root.attributes('-zoomed', True)  # Optional: make window maximized
+        root.state('zoomed')  # Maximize window on Windows
         app = ShotAccuracyApp(root)
         root.mainloop()
 
