@@ -68,7 +68,10 @@ class ShotsData:
         - 2D: columns 'X (cm)' and 'Y (cm)'
         - 1D: column 'distance_m' (values in meters, converted to cm)
         """
-        df_shots = pd.read_excel(path)
+        with open(path, 'rb') as f:
+            data = f.read()
+        import io
+        df_shots = pd.read_excel(io.BytesIO(data))
         self.shots.clear()
         if 'X (cm)' in df_shots.columns and 'Y (cm)' in df_shots.columns:
             for _, row in df_shots.iterrows():
