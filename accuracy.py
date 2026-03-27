@@ -80,8 +80,9 @@ class ShotsData:
                 self.shots.append((x, y))
         elif 'distance_m' in df_shots.columns:
             # Drop summary/header rows: keep only rows with integer index
-            idx = pd.to_numeric(df_shots['index'], errors='coerce')
-            df_shots = df_shots[idx.notna() & (idx % 1 == 0)]
+            if 'index' in df_shots.columns:
+                idx = pd.to_numeric(df_shots['index'], errors='coerce')
+                df_shots = df_shots[idx.notna() & (idx % 1 == 0)]
             df_shots['distance_m'] = pd.to_numeric(df_shots['distance_m'], errors='coerce')
             df_shots = df_shots.dropna(subset=['distance_m'])
             for _, row in df_shots.iterrows():
